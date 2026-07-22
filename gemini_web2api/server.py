@@ -8,7 +8,54 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import log
+from .bridge import bridge_manager
+
+def generate_stream_bridge(prompt, model_id, think_mode, file_refs, extra_fields):
+    task_id = uuid.uuid4().hex
+    task = bridge_manager.submit_task(task_id, {
+        "prompt": prompt,
+        "model_id": model_id,
+        "think_mode": think_mode,
+        "file_refs": file_refs,
+        "extra_fields": extra_fields
+    })
+
+    # We yield parts as they arrive. The browser returns raw 'wrb.fr' chunks. We need to parse them.
+    from .gemini import _extract_texts_from_line, clean_text
+
+    prev_text = ""
+    buf = ""
+    try:
+        while True:
+            msg_type, data = task.queue.get(timeout=300) # 5 min timeout
+            if msg_type == "error":
+                raise Exception(data)
+            elif msg_type == "done":
+                break
+            elif msg_type == "chunk":
+                buf += data
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    for t in _extract_texts_from_line(line):
+                        if len(t) > len(prev_text):
+                            delta = clean_text(t[len(prev_text):])
+                            if delta:
+                                yield delta
+                            prev_text = t
+    finally:
+        bridge_manager.remove_task(task_id)
+
+
+def generate_bridge(prompt, model_id, think_mode, file_refs, extra_fields):
+    text = ""
+    for delta in generate_stream_bridge(prompt, model_id, think_mode, file_refs, extra_fields):
+        if delta:
+            text += delta
+    return text
+
+
+from .bridge import bridge_manager
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import upload_image, fetch_image_bytes
 from . import __version__
@@ -97,7 +144,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
+
+            if self.path == "/internal/poll":
+                task = bridge_manager.get_pending_task(timeout=10)
+                if task:
+                    self.send_json({
+                        "task_id": task.task_id,
+                        "prompt": task.data.get("prompt"),
+                        "model_id": task.data.get("model_id"),
+                        "think_mode": task.data.get("think_mode"),
+                        "file_refs": task.data.get("file_refs"),
+                        "extra_fields": task.data.get("extra_fields")
+                    })
+                else:
+                    self.send_response(204)
+                    self.end_headers()
+                return
+
             if self.path == "/v1/models":
+
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
@@ -123,14 +188,32 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
+
+            if self.path.startswith("/internal/"):
+                if self.path == "/internal/chunk/" or self.path.startswith("/internal/chunk/"):
+                    task_id = self.path.split("/")[3].split("?")[0]
+                    chunk = body.decode("utf-8", errors="ignore")
+                    if "?done=1" in self.path:
+                        bridge_manager.mark_done(task_id)
+                    else:
+                        bridge_manager.push_chunk(task_id, chunk)
+                    self.send_json({"status": "ok"})
+                elif self.path.startswith("/internal/error/"):
+                    task_id = self.path.split("/")[3]
+                    error = body.decode("utf-8", errors="ignore")
+                    bridge_manager.mark_error(task_id, error)
+                    self.send_json({"status": "ok"})
+                return
+
             if self.path == "/v1/chat/completions":
+
                 self._handle_chat(body)
             elif self.path == "/v1/responses":
                 self._handle_responses(body)
             elif ":generateContent" in self.path:
-                self._handle_google_generate(body, stream=False)
+                self._handle_google_generate_bridge(body, stream=False)
             elif ":streamGenerateContent" in self.path:
-                self._handle_google_generate(body, stream=True)
+                self._handle_google_generate_bridge(body, stream=True)
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -168,7 +251,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream and (not tools or tool_choice == "none"):
             try:
                 self._start_sse()
-                for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields):
+                for delta in generate_stream_bridge(prompt, model_id, think_mode, _upload_images(images), extra_fields):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -183,7 +266,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            text = generate_bridge(prompt, model_id, think_mode, _upload_images(images), extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -274,7 +357,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            text = generate_bridge(prompt, model_id, think_mode, _upload_images(images), extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -321,7 +404,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 
-    def _handle_google_generate(self, body: bytes, stream: bool):
+    def _handle_google_generate_bridge(self, body: bytes, stream: bool):
         req = self._parse_body(body)
         if req is None:
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
@@ -348,7 +431,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in generate_stream_bridge(prompt, model_id, think_mode, file_refs, extra_fields):
                     if not delta:
                         continue
                     full_text += delta
@@ -374,7 +457,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = generate_bridge(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return

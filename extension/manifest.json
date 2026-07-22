@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Gemini Web2API Bridge",
+  "version": "1.0.0",
+  "description": "Bridges local OpenAI requests to Web Gemini using browser auth.",
+  "permissions": [
+    "storage",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "http://localhost:8081/*",
+    "http://127.0.0.1:8081/*",
+    "https://gemini.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Gemini Web2API Bridge Active"
+  }
+}
