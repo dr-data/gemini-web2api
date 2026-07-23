@@ -1,113 +1,151 @@
-const PYTHON_SERVER_URL = "http://localhost:8081";
+import { resolveModel, messagesToPrompt, buildPayload, extractTextsFromLine, cleanText } from './gemini.js';
 
 async function fetchXsrfToken() {
-  try {
-    const res = await fetch("https://gemini.google.com/app", { credentials: "include" });
-    const text = await res.text();
-    const match = text.match(/"SNlM0e":"([^"]+)"/);
-    if (match) {
-      return match[1];
+    try {
+        const res = await fetch("https://gemini.google.com/app", { credentials: "include" });
+        const text = await res.text();
+        const match = text.match(/"SNlM0e":"([^"]+)"/);
+        if (match) {
+            return match[1];
+        }
+    } catch (e) {
+        console.error("Failed to fetch XSRF token:", e);
     }
-  } catch (e) {
-    console.error("Failed to fetch XSRF token:", e);
-  }
-  return null;
+    return null;
 }
 
-async function handleTask(task) {
-  try {
-    console.log(`Handling task ${task.task_id}`);
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.type === "EXECUTE_GEMINI") {
+        const payload = request.payload;
+
+        handleGeminiRequest(payload, sender.tab.id, request.id).then(response => {
+            if (!payload.stream) {
+                sendResponse(response);
+            }
+        }).catch(err => {
+            if (!payload.stream) {
+                sendResponse({ error: { message: err.toString() } });
+            }
+        });
+
+        // Return true to indicate we will send response asynchronously
+        return true;
+    }
+});
+
+async function handleGeminiRequest(payload, tabId, requestId) {
+    const modelInfo = resolveModel(payload.model || "gemini-3.6-flash");
+    const prompt = messagesToPrompt(payload.messages || []);
+    const fReq = buildPayload(prompt, modelInfo.modelId, modelInfo.thinkMode);
+
     const xsrfToken = await fetchXsrfToken();
     const reqid = Math.floor(Date.now() / 1000) % 1000000;
     const url = `https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=boq_assistant-bard-web-server_20260716.08_p0&hl=en&_reqid=${reqid}&rt=c`;
 
-    const inner = new Array(102).fill(null);
-    if (task.file_refs && task.file_refs.length > 0) {
-       inner[0] = [task.prompt, 0, null, task.file_refs.map(ref => [null, null, ref]), null, null, 0];
-    } else {
-       inner[0] = [task.prompt, 0, null, null, null, null, 0];
-    }
-    inner[1] = ["en"];
-    inner[2] = ["", "", "", null, null, null, null, null, null, ""];
-    inner[6] = [0];
-    inner[7] = 1;
-    inner[10] = 1;
-    inner[11] = 0;
-    inner[17] = [[task.think_mode]];
-    inner[18] = 0;
-    inner[27] = 1;
-    inner[30] = [4];
-    inner[41] = [2];
-    inner[53] = 0;
-    inner[59] = crypto.randomUUID();
-    inner[61] = [];
-    inner[68] = 1;
-    inner[79] = task.model_id;
-    if (task.extra_fields) {
-       for (const [k, v] of Object.entries(task.extra_fields)) {
-           inner[k] = v;
-       }
-    }
-
-    const outer = [null, JSON.stringify(inner)];
     const params = new URLSearchParams();
-    params.append("f.req", JSON.stringify(outer));
-    if (xsrfToken) {
-       params.append("at", xsrfToken);
-    }
+    params.append("f.req", fReq);
+    if (xsrfToken) params.append("at", xsrfToken);
 
     const response = await fetch(url, {
-       method: "POST",
-       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-       body: params.toString(),
-       credentials: "include"
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: params.toString(),
+        credentials: "include"
     });
 
     if (!response.ok) {
-       throw new Error(`Gemini API returned ${response.status} ${response.statusText}`);
+        throw new Error(`Upstream returned ${response.status}`);
     }
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder("utf-8");
+    const cid = `chatcmpl-${crypto.randomUUID().slice(0, 12)}`;
 
-    while(true) {
-       const { done, value } = await reader.read();
-       if (done) break;
-       const chunk = decoder.decode(value, { stream: true });
-       await fetch(`${PYTHON_SERVER_URL}/internal/chunk/${task.task_id}`, {
-          method: "POST",
-          body: chunk
-       });
+    if (payload.stream) {
+        let port;
+        try {
+             port = chrome.tabs.connect(tabId);
+        } catch(e) {
+             return; // Tab closed
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let prevText = "";
+        let buf = "";
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+
+            let parts = buf.split("\n");
+            buf = parts.pop(); // keep last incomplete line in buffer
+
+            for (const line of parts) {
+                const texts = extractTextsFromLine(line);
+                for (const t of texts) {
+                    if (t.length > prevText.length) {
+                        const delta = cleanText(t.slice(prevText.length));
+                        if (delta) {
+                            const chunkObj = {
+                                id: cid, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000),
+                                model: modelInfo.resolvedName, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
+                            };
+                            port.postMessage({ id: requestId, chunk: `data: ${JSON.stringify(chunkObj)}\n\n` });
+                        }
+                        prevText = t;
+                    }
+                }
+            }
+        }
+
+        // flush buffer
+        if (buf) {
+             const texts = extractTextsFromLine(buf);
+             for (const t of texts) {
+                 if (t.length > prevText.length) {
+                     const delta = cleanText(t.slice(prevText.length));
+                     if (delta) {
+                         const chunkObj = {
+                                id: cid, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000),
+                                model: modelInfo.resolvedName, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
+                            };
+                         port.postMessage({ id: requestId, chunk: `data: ${JSON.stringify(chunkObj)}\n\n` });
+                     }
+                 }
+             }
+        }
+
+        const endObj = {
+            id: cid, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000),
+            model: modelInfo.resolvedName, choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+        };
+        port.postMessage({ id: requestId, chunk: `data: ${JSON.stringify(endObj)}\n\ndata: [DONE]\n\n` });
+        port.postMessage({ id: requestId, done: true });
+        return;
     }
-    // send end signal
-    await fetch(`${PYTHON_SERVER_URL}/internal/chunk/${task.task_id}?done=1`, {
-       method: "POST"
-    });
-    console.log(`Finished task ${task.task_id}`);
-  } catch(e) {
-    console.error(`Task ${task.task_id} failed:`, e);
-    await fetch(`${PYTHON_SERVER_URL}/internal/error/${task.task_id}`, {
-       method: "POST",
-       body: e.toString()
-    });
-  }
+
+    // Non-streaming
+    const raw = await response.text();
+    let finalContent = "";
+    for (const line of raw.split("\n")) {
+        const texts = extractTextsFromLine(line);
+        for (const t of texts) {
+             if (t.length > finalContent.length) {
+                 finalContent = t;
+             }
+        }
+    }
+    finalContent = cleanText(finalContent);
+
+    return {
+        id: cid,
+        object: "chat.completion",
+        created: Math.floor(Date.now()/1000),
+        model: modelInfo.resolvedName,
+        choices: [{
+            index: 0,
+            message: { role: "assistant", content: finalContent },
+            finish_reason: "stop"
+        }]
+    };
 }
-
-async function pollTasks() {
-  while (true) {
-    try {
-      const res = await fetch(`${PYTHON_SERVER_URL}/internal/poll`);
-      if (res.status === 200) {
-        const task = await res.json();
-        // Handle task asynchronously so we can poll for more immediately
-        handleTask(task);
-      }
-    } catch (e) {
-      // Server down or offline, sleep a bit before retrying
-      await new Promise(r => setTimeout(r, 2000));
-    }
-  }
-}
-
-// Start polling
-pollTasks();

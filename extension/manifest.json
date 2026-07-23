@@ -1,22 +1,30 @@
 {
   "manifest_version": 3,
-  "name": "Gemini Web2API Bridge",
+  "name": "Gemini Web2API Fetch Interceptor",
   "version": "1.0.0",
-  "description": "Bridges local OpenAI requests to Web Gemini using browser auth.",
+  "description": "Intercepts OpenAI API requests in the browser and translates them to Gemini Web.",
   "permissions": [
-    "storage",
-    "declarativeNetRequest"
+    "scripting"
   ],
   "host_permissions": [
-    "http://localhost:8081/*",
-    "http://127.0.0.1:8081/*",
-    "https://gemini.google.com/*"
+    "<all_urls>"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["inject.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
   ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
-  },
-  "action": {
-    "default_title": "Gemini Web2API Bridge Active"
   }
 }
