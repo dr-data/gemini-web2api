@@ -19,7 +19,7 @@ function makeSapisidHash(sapisid) {
     return `SAPISIDHASH ${ts}_${hash}`;
 }
 
-const server = http.createServer((req, res) => {
+export const server = http.createServer((req, res) => {
     // CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -91,6 +91,10 @@ async function handleChat(req, res, payload) {
                 executeGeminiRequest(url, options, params, res, payload, modelInfo, cid);
             });
         });
+        tokenReq.on('error', (e) => {
+            console.error('Failed to fetch token:', e);
+            executeGeminiRequest(url, options, params, res, payload, modelInfo, cid);
+        });
         tokenReq.end();
     } catch(e) {
         // Fallback without XSRF token
@@ -99,7 +103,7 @@ async function handleChat(req, res, payload) {
 }
 
 
-function executeGeminiRequest(url, options, params, res, payload, modelInfo, cid) {
+export function executeGeminiRequest(url, options, params, res, payload, modelInfo, cid) {
     const clientReq = https.request(url, options, (clientRes) => {
         if (clientRes.statusCode !== 200) {
             res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -206,6 +210,8 @@ function executeGeminiRequest(url, options, params, res, payload, modelInfo, cid
     clientReq.end();
 }
 
-server.listen(PORT, () => {
-    console.log(`js-server listening on http://localhost:${PORT}`);
-});
+if (process.argv[1] && process.argv[1].endsWith('server.js')) {
+    server.listen(PORT, () => {
+        console.log(`js-server listening on http://localhost:${PORT}`);
+    });
+}
