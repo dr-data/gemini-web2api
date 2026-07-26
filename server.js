@@ -80,7 +80,7 @@ async function handleChat(req, res, payload) {
 
     // Try fetching XSRF token if running in an environment where we can request it
     try {
-        const tokenReq = https.request('https://gemini.google.com/app', { headers: { Cookie: COOKIE } }, (tokenRes) => {
+        const tokenReq = https.request('https://gemini.google.com/app', { headers: { Cookie: COOKIE }, timeout: 10000 }, (tokenRes) => {
             let tokenData = '';
             tokenRes.on('data', chunk => tokenData += chunk.toString());
             tokenRes.on('end', () => {
@@ -90,6 +90,11 @@ async function handleChat(req, res, payload) {
                 }
                 executeGeminiRequest(url, options, params, res, payload, modelInfo, cid);
             });
+        });
+        tokenReq.on('timeout', () => {
+            console.warn('Token fetch timeout. Proceeding without it.');
+            tokenReq.destroy();
+            executeGeminiRequest(url, options, params, res, payload, modelInfo, cid);
         });
         tokenReq.on('error', (e) => {
             console.error('Failed to fetch token:', e);
@@ -105,6 +110,16 @@ async function handleChat(req, res, payload) {
 
 export function executeGeminiRequest(url, options, params, res, payload, modelInfo, cid) {
     const clientReq = https.request(url, options, (clientRes) => {
+        clientRes.on('error', (err) => {
+            console.error('Stream response error:', err);
+            if (!res.headersSent) {
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: err.toString() } }));
+            } else {
+                res.end();
+            }
+        });
+
         if (clientRes.statusCode !== 200) {
             res.writeHead(502, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: { message: `Upstream returned ${clientRes.statusCode}` } }));
