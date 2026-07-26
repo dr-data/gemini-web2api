@@ -1,0 +1,10 @@
+{
+  "name": "gemini-js-server",
+  "version": "1.0.0",
+  "description": "Pure JS server for Gemini Web2API",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
